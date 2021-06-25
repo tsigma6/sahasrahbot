@@ -9,6 +9,7 @@ from alttprbot import models
 from alttprbot.exceptions import SahasrahBotException
 from alttprbot_discord.bot import discordbot
 from alttprbot_racetime import bot as racetime
+from alttprbot.util import speedgaming
 
 TOURNAMENT_RESULTS_SHEET = os.environ.get('TOURNAMENT_RESULTS_SHEET', None)
 RACETIME_URL = os.environ.get('RACETIME_URL', 'https://racetime.gg')
@@ -21,50 +22,110 @@ class UnableToLookupUserException(SahasrahBotException):
 class UnableToLookupEpisodeException(SahasrahBotException):
     pass
 
-class TournamentPlayerBase(object):
+class Tournament(object):
+    def __init__(self, event):
+        self.data = None
+        self.audit_channel = None
+        self.commentary_channel = None
+        self.scheduling_needs_channel = None
+        self.mod_channel = None
+        self.event = event
+        self.racetime_category = None
+
+    @classmethod
+    async def construct(cls, event):
+        tournament = cls(event)
+        await tournament.update()
+
+    async def update(self):
+        self.data = await models.Tournaments.get(self.event)
+        self.racetime_category = racetime.racetime_bots[self.data.category]
+
+        self.guild = discordbot.get_guild(self.data.guild_id)
+
+        if self.data.audit_channel_id:
+            self.audit_channel = discordbot.get_channel(self.data.audit_channel_id)
+
+        if self.data.commentary_channel_id:
+            self.commentary_channel = discordbot.get_channel(self.data.commentary_channel_id)
+
+        if self.data.scheduling_needs_channel_id:
+            self.scheduling_needs_channel = discordbot.get_channel(self.data.scheduling_needs_channel_id)
+
+        if self.data.mod_channel_id:
+            self.mod_channel = discordbot.get_channel(self.data.mod_channel_id)
+
+class TournamentPerson(object):
     def __init__(self):
         self.name = None
         self.discord_id = None
         self.discord_user = None
         self.racetime_id = None
+        self.twitch_name = None
 
     @classmethod
     async def construct(cls, discord_id, guild):
-        playerobj = cls()
+        person = cls()
 
         srlnick = await models.SRLNick.get_or_none(discord_user_id=discord_id)
 
-        playerobj.discord_user = guild.get_member(discord_id)
-        playerobj.discord_id = discord_id
-        playerobj.name = playerobj.discord_user.name
+        person.discord_user = guild.get_member(discord_id)
+        person.discord_id = discord_id
+        person.name = person.discord_user.name
 
         if srlnick:
-            playerobj.racetime_id = srlnick.rtgg_id
+            person.racetime_id = srlnick.rtgg_id
+            person.twitch_name = srlnick.twitch_name
 
-        return playerobj
+        return person
 
 
-class TournamentRaceBase(object):
-    def __init__(self, episode_id: int, event: str, racetime_category: racetime.SahasrahBotRaceTimeBot):
+class TournamentRaceSpeedGaming(object):
+    def __init__(self, episode_id: int, tournament: Tournament):
         self.episode_id = int(episode_id)
-        self.schedule = "sahasrahbot"
-        self.racetime_category = racetime_category
-        self.event = event
+        self.schedule = "speedgaming"
+        self.tournament = tournament
 
     @classmethod
-    async def construct(cls, episode_id: int, event: str, racetime_category: racetime.SahasrahBotRaceTimeBot):
-        tournament_race = cls(episode_id, event, racetime_category)
+    async def construct(cls, episode_id: int, tournament: Tournament):
         await discordbot.wait_until_ready()
-        tournament_race.data = await models.Tournaments.get_or_none(tournament_race.event)
 
+        tournament_race = cls(episode_id, tournament)
         await tournament_race.update_data()
         return tournament_race
 
     async def update_data(self):
-        pass
+        self.episode = await speedgaming.get_episode(self.episodeid)
 
-    async def make_tournament_player(self, player):
-        pass
+        if self.episode is None:
+            raise UnableToLookupEpisodeException('SG Episode ID not a recognized event.  This should not have happened.')
+
+        self.players = await self.lookup_persons(self.episode['match1']['players'])
+        self.commentators = await self.lookup_persons([c for c in self.episode['commentators'] if c['approved']])
+        self.trackers = await self.lookup_persons([c for c in self.episode['trackers'] if c['approved']])
+        self.broadcasters = await self.lookup_persons([c for c in self.episode['broadcasters'] if c['approved']])
+
+        # self.bracket_settings = await tournament_games.get_game_by_episodeid_submitted(self.episodeid)
+        self.seed_settings = await models.TournamentGames.get_or_none(episode_id=self.episode_id)
+
+    @staticmethod
+    async def lookup_persons(data):
+        persons = []
+        for p in data:
+            # first try a more concrete match of using the discord id cached by SG
+            looked_up_player = await TournamentPerson.construct(discord_id=int(p['discordId']), guild=self.guild)
+            if looked_up_player:
+                persons.append(looked_up_player)
+                continue
+
+            looked_up_player = await TournamentPerson.construct(discord_id=int(p['discordTag']), guild=self.guild)
+            if looked_up_player:
+                persons.append(looked_up_player)
+                continue
+
+            raise UnableToLookupUserException(f"Cannot lookup {p['displayName']}")
+
+        return persons
 
     async def send_audit_message(self):
         pass
@@ -155,8 +216,16 @@ class TournamentRaceBase(object):
         return None
 
     @property
+    def event_name(self):
+        return self.episode['event']['shortName']
+
+    @property
+    def event_slug(self):
+        return self.episode['event']['slug']
+
+    @property
     def friendly_name(self):
-        return None
+        return self.episode['match1']['title']
 
     @property
     def versus(self):
@@ -176,15 +245,15 @@ class TournamentRaceBase(object):
 
     @property
     def broadcast_channels(self):
-        return None
+        return [a['name'] for a in self.episode['channels'] if not " " in a['name']]
 
     @property
     def racetime_room_name(self):
-        return self.racetime_handler.data.get('name')
+        return self.tournament.racetime_handler.data.get('name')
 
     @property
     def racetime_url(self):
-        return self.racetime_handler.bot.http_uri(self.racetime_handler.data['url'])
+        return self.tournament.racetime_handler.bot.http_uri(self.tournament.racetime_handler.data['url'])
 
     async def can_gatekeep(self, rtgg_id):
         guild = discordbot.get_guild(self.data.guild_id)
