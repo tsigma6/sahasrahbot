@@ -87,7 +87,7 @@ ALTTPR_FR_SETTINGS_LIST = [
         'label': 'Enemy Shuffle',
         'settings': {
             'none': 'Off',
-            'random': 'Random'
+            'shuffled': 'Shuffled'
         }
     },
     {
@@ -126,6 +126,22 @@ ALTTPR_FR_SETTINGS_LIST = [
     },
 ]
 
+ALTTPR_ES_SETTINGS_LIST = [
+    {
+        'key': 'preset',
+        'label': 'Preset',
+        'settings': {
+            'ambrosia': 'Ambrosia',
+            'casualboots': 'Casual Boots',
+            'mcs': 'Maps, Compasses, and Small Keys',
+            'open': 'Open',
+            'standard': 'Standard',
+            'dungeons': 'All Dungeons (Round of 8 only)',
+            'keysanity': 'Keysanity (Round of 8 only)',
+        }
+    }
+]
+
 class UnableToLookupUserException(SahasrahBotException):
     pass
 
@@ -154,6 +170,8 @@ class TournamentPlayer():
         playerobj = cls()
 
         playerobj.discord_user = guild.get_member_named(discord_name)
+        if playerobj.discord_user is None:
+            raise UnableToLookupUserException(f"Unable to lookup player {discord_name}")
         playerobj.name = discord_name
         result = await srlnick.get_nickname(playerobj.discord_user.id)
         playerobj.data = result
@@ -227,6 +245,12 @@ class TournamentRace():
             settings=json.loads(self.bracket_settings['settings'])
         )
 
+    async def roll_alttprhmg(self):
+        self.seed, self.preset_dict = await preset.get_preset('hybridmg', allow_quickswap=True)
+
+    async def roll_alttpres(self):
+        self.seed, self.preset_dict = await preset.get_preset('open', allow_quickswap=True)
+
     # test
     async def roll_test(self):
         if self.bracket_settings is None:
@@ -243,7 +267,7 @@ class TournamentRace():
 
     @property
     def submit_link(self):
-        return f"{APP_URL}/{self.event_slug}?episode_id={self.episodeid}"
+        return f"{APP_URL}/submit/{self.event_slug}?episode_id={self.episodeid}"
 
     @property
     def game_number(self):
@@ -461,7 +485,7 @@ async def create_tournament_race_room(episodeid, category='alttpr', goal='Beat t
             continue
 
     if category != 'smw-hacks':
-        await handler.send_message('Welcome. Use !tournamentrace (without any arguments) to roll your seed!  This should be done about 5 minutes prior to the start of your race.  If you need help, ping @Mods in the ALTTPR Tournament Discord.')
+        await handler.send_message('Welcome. Use !tournamentrace (without any arguments) to roll your seed!  This should be done about 5 minutes prior to the start of your race.')
 
     return handler.data
 
@@ -472,7 +496,7 @@ async def alttprfr_process_settings_form(payload):
     tournament_race = await TournamentRace.construct(episodeid=episode_id)
 
     embed = discord.Embed(
-        title=f"ALTTPR DE - {tournament_race.versus}",
+        title=f"ALTTPR FR - {tournament_race.versus}",
         description='Thank you for submitting your settings for this race!  Below is what will be played.\nIf this is incorrect, please contact a tournament admin.',
         color=discord.Colour.blue()
     )
@@ -508,6 +532,9 @@ async def alttprfr_process_settings_form(payload):
         "allow_quickswap": True
     }
 
+    if settings['enemizer']['enemy_shuffle'] != "none" and settings['mode'] == 'standard':
+        settings['weapons'] = 'assured'
+
     settings_formatted = ""
     for setting in ALTTPR_FR_SETTINGS_LIST:
         settings_formatted += f"**{setting['label']}:** {setting['settings'][payload.get(setting['key'])]}\n"
@@ -515,6 +542,46 @@ async def alttprfr_process_settings_form(payload):
     embed.add_field(name="Settings", value=settings_formatted)
 
     await models.TournamentGames.update_or_create(episode_id=episode_id, defaults={'settings': settings, 'event': 'alttprfr'})
+
+    audit_channel_id = tournament_race.data['audit_channel_id']
+    if audit_channel_id is not None:
+        audit_channel = discordbot.get_channel(audit_channel_id)
+        await audit_channel.send(embed=embed)
+    else:
+        audit_channel = None
+
+    for name, player in tournament_race.player_discords:
+        if player is None:
+            await audit_channel.send(f"@here could not send DM to {name}", allowed_mentions=discord.AllowedMentions(everyone=True), embed=embed)
+            continue
+        try:
+            await player.send(embed=embed)
+        except discord.HTTPException:
+            if audit_channel is not None:
+                await audit_channel.send(f"@here could not send DM to {player.name}#{player.discriminator}", allowed_mentions=discord.AllowedMentions(everyone=True), embed=embed)
+
+    return tournament_race
+
+async def alttpres_process_settings_form(payload):
+    episode_id = int(payload['episodeid'])
+
+    tournament_race = await TournamentRace.construct(episodeid=episode_id)
+
+    embed = discord.Embed(
+        title=f"ALTTPR ES - {tournament_race.versus}",
+        description='Thank you for submitting your settings for this race!  Below is what will be played.\nIf this is incorrect, please contact a tournament admin.',
+        color=discord.Colour.blue()
+    )
+
+    preset_dict = await preset.fetch_preset(payload['preset'])
+
+    preset_dict['tournament'] = True
+    preset_dict['allow_quickswap'] = True
+    preset_dict['spoilers'] = 'off'
+
+    embed.add_field(name="Preset", value=payload['preset'])
+
+    await models.TournamentGames.update_or_create(episode_id=episode_id, defaults={'settings': preset_dict['settings'], 'event': 'alttpres'})
 
     audit_channel_id = tournament_race.data['audit_channel_id']
     if audit_channel_id is not None:
